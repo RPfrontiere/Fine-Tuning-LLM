@@ -1,18 +1,11 @@
-from peft import LoraConfig, get_peft_model
-from transformers import AlbertForQuestionAnswering , AutoTokenizer
-import pandas as pd
-from peft import LoraConfig, TaskType
-from transformers import TrainingArguments , Trainer 
+from peft import LoraConfig, TaskType, PeftModel, get_peft_model, PeftConfig
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer, TrainingArguments, Trainer, DefaultDataCollator
+from datasets import load_dataset, DatasetDict, Dataset
 from sklearn.model_selection import train_test_split
 import numpy as np
-#import os
-#from huggingface_hub import HfApi
-
-def load_model(model_name):
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AlbertForQuestionAnswering.from_pretrained(model_name)
-
-        return tokenizer, model
+import pandas as pd
+import evaluate
+import torch
 
 def lora_config():
      
@@ -28,13 +21,12 @@ def lora_config():
 
 def training_config():
 
-
     training_args = TrainingArguments(
     output_dir="outputs",
     learning_rate=5e-4,
     num_train_epochs=50,
-    per_device_train_batch_size=32,
-    per_device_eval_batch_size=32,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
     evaluation_strategy="epoch",
     save_strategy="epoch",
     weight_decay= 0.01,
@@ -43,76 +35,93 @@ def training_config():
     return training_args
 
     
-def trainer_definition(lora_model, training_args, train_ds,test_ds, computed_metrics):
+def trainer_definition(lora_model, training_args, tokenized_squad, tokenizer, data_collator):
     trainer = Trainer(
     model=lora_model,
     args=training_args,
-    train_dataset=train_ds,
-    eval_dataset=test_ds,
-    compute_metrics=computed_metrics,
+    train_dataset=tokenized_squad["train"],
+    eval_dataset=tokenized_squad["test"],
+    tokenizer= tokenizer,
+    data_collator= data_collator,
 )
     return trainer
 
+def preprocess_function(examples):
+    questions = [q.strip() for q in examples["question"]]
+    inputs = tokenizer(
+        questions,
+        examples["context"],
+        max_length=384,
+        truncation="only_second",
+        return_offsets_mapping=True,
+        padding="max_length",
+    )
 
-def create_ds(ds):
+    offset_mapping = inputs.pop("offset_mapping")
+    answers = examples["answers"]
+    start_positions = []
+    end_positions = []
 
-    train_ds, test_ds = train_test_split(ds, test_size=0.2, random_state=42)
+    for i, offset in enumerate(offset_mapping):
+        answer = answers[i]
+        start_char = answer["answer_start"][0]
+        end_char = answer["answer_start"][0] + len(answer["text"][0])
+        sequence_ids = inputs.sequence_ids(i)
 
-    print("train is:",len(train_ds), "test is :", len(test_ds))
+        # Find the start and end of the context
+        idx = 0
+        while sequence_ids[idx] != 1:
+            idx += 1
+        context_start = idx
+        while sequence_ids[idx] == 1:
+            idx += 1
+        context_end = idx - 1
 
-    return train_ds, test_ds
+        # If the answer is not fully inside the context, label it (0, 0)
+        if offset[context_start][0] > end_char or offset[context_end][1] < start_char:
+            start_positions.append(0)
+            end_positions.append(0)
+        else:
+            # Otherwise it's the start and end token positions
+            idx = context_start
+            while idx <= context_end and offset[idx][0] <= start_char:
+                idx += 1
+            start_positions.append(idx - 1)
 
-def tokenize_dataset(train_ds, test_ds):
-     train_ds_tokenize = []
-     test_ds_tokenize = []
+            idx = context_end
+            while idx >= context_start and offset[idx][1] >= end_char:
+                idx -= 1
+            end_positions.append(idx + 1)
 
-     for index, row in train_ds.iterrows():
-          l =[]
-          l.append(row["text"][:512])
-          tk = tokenizer(l)
-          train_ds_tokenize.append(tk)
-
-
-     for index, row in test_ds.iterrows():
-          l =[]
-          l.append(row["text"][:509])
-          tk = tokenizer(l)
-          test_ds_tokenize.append(tk)
-    
-
-     return train_ds_tokenize,test_ds_tokenize
-              
+    inputs["start_positions"] = start_positions
+    inputs["end_positions"] = end_positions
+    return inputs                
 
 if __name__ == "__main__":
-    
-    """
-    token = "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"
-    print(token)
-    api = HfApi()
-    api.create_repo("repo_name", token = token)
-    """
 
-    model_name = "twmkn9/albert-base-v2-squad2"
-    tokenizer, model = load_model(model_name)
+    #Define model and Dataset   
+    model_name = "distilbert/distilbert-base-uncased"
+    model = AutoModelForQuestionAnswering.from_pretrained(model_name)
+    squad = load_dataset("squad", split = "train[:5000]")
+    squad = squad.train_test_split(test_size=0.2)
+    print(squad["train"][0])
+    #Define tokenizer and preprocess function
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenized_squad = squad.map(preprocess_function, batched= True, remove_columns=squad["train"].column_names)
+
+    #Define an example batch
+    data_collator = DefaultDataCollator()
+
     config = lora_config()
 
-    train = training_config()
+    training_args = training_config()
 
     lora_model = get_peft_model(model, config)
 
     lora_model.print_trainable_parameters()
 
-    train_args = training_config()
-    
-    splits = {'train': 'data/train-00000-of-00001-b42a775f407cee45.parquet', 'validation': 'data/validation-00000-of-00001-134b8fd0c89408b6.parquet'}
-    df = pd.read_parquet("hf://datasets/OpenAssistant/oasst1/" + splits["train"])
-    df = df[['text','role']]
-    train_ds, test_ds = create_ds(df)
-    #tokenizzare il training ed il test set
-    train_ds_tokenize, test_ds_tokenize = tokenize_dataset(train_ds,test_ds)
-    """  
-    computed_metrics = compute_metrics() 
+    trainer = trainer_definition( lora_model, training_args, tokenized_squad, tokenizer, data_collator )
 
-    trainer = trainer_definition(lora_model=lora_model,training_args=train_args,train_ds= train_ds_tokenize, test_ds= test_ds_tokenize, compute_metrics= computed_metrics)
     trainer.train()
-    """
+    
+   
